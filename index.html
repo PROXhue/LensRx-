@@ -169,7 +169,29 @@ opacity: 0; transition: opacity 0.3s; pointer-events: none;
 }
 #error-toast.visible { opacity: 1; }
 
-/* ── RESULTS PANEL ── */
+/* ── SCAN BUTTON ── */
+#scan-btn {
+position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%);
+z-index: 40; display: none;
+width: 72px; height: 72px; border-radius: 50%;
+background: linear-gradient(135deg, var(–accent), var(–accent2));
+border: 3px solid rgba(255,255,255,0.15);
+box-shadow: 0 4px 30px rgba(79,142,247,0.5);
+align-items: center; justify-content: center;
+cursor: pointer; transition: transform 0.15s, box-shadow 0.15s;
+}
+#scan-btn:active { transform: translateX(-50%) scale(0.92); box-shadow: 0 2px 14px rgba(79,142,247,0.3); }
+#scan-btn svg { width: 30px; height: 30px; }
+#scan-btn.scanning {
+background: rgba(79,142,247,0.15);
+border-color: rgba(79,142,247,0.4);
+box-shadow: 0 0 0 8px rgba(79,142,247,0.1);
+animation: btn-pulse 1s ease-in-out infinite;
+}
+@keyframes btn-pulse { 0%,100%{box-shadow:0 0 0 8px rgba(79,142,247,0.1)} 50%{box-shadow:0 0 0 16px rgba(79,142,247,0.05)} }
+
+/* push results panel up above the button */
+#results-panel { padding-bottom: 100px; }
 #results-panel {
 position: fixed; bottom: 0; left: 0; right: 0; z-index: 30;
 max-height: 55vh; display: flex; flex-direction: column;
@@ -293,6 +315,15 @@ animation: card-in 0.35s cubic-bezier(0.16,1,0.3,1) both;
 <div id="hint">POINT AT A LABEL OR INVOICE</div>
 <div id="error-toast"></div>
 
+<!-- SCAN BUTTON -->
+
+<button id="scan-btn" onclick="captureAndAnalyze()">
+  <svg viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="15" cy="15" r="11" stroke="white" stroke-width="2"/>
+    <circle cx="15" cy="15" r="6" fill="white"/>
+  </svg>
+</button>
+
 <!-- RESULTS -->
 
 <div id="results-panel">
@@ -307,11 +338,9 @@ animation: card-in 0.35s cubic-bezier(0.16,1,0.3,1) both;
   // ── CONFIG ──────────────────────────────────────────────
   const GEMINI_API_KEY = "AIzaSyA4zOaMQUww2ga3sscYISvuOsA9AnduQ4s";
   const GEMINI_URL = `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-  const SCAN_INTERVAL_MS = 4000; // scan every 4 seconds
   // ────────────────────────────────────────────────────────
 
   let mode = 'label';
-  let scanning = false;
   let isAnalyzing = false;
   let errorToastTimer = null;
 
@@ -328,6 +357,7 @@ animation: card-in 0.35s cubic-bezier(0.16,1,0.3,1) both;
   const flash       = document.getElementById('flash');
   const modeBadge   = document.getElementById('mode-badge');
   const drugCount   = document.getElementById('drug-count');
+  const scanBtn     = document.getElementById('scan-btn');
   const errorToast  = document.getElementById('error-toast');
 
   function selectMode(m) {
@@ -367,17 +397,16 @@ animation: card-in 0.35s cubic-bezier(0.16,1,0.3,1) both;
       applyModeUI();
       statusDot.classList.add('active');
       hint.classList.add('visible');
-      scanning = true;
-      setTimeout(captureAndAnalyze, 1000); // first scan after 1s
+      scanBtn.style.display = 'flex';
     } catch (e) {
       alert('Camera access denied. Please allow camera permissions and reload.');
     }
   }
 
   async function captureAndAnalyze() {
-    if (!scanning) return;
-    if (isAnalyzing) { setTimeout(captureAndAnalyze, SCAN_INTERVAL_MS); return; }
+    if (isAnalyzing) return;
     isAnalyzing = true;
+    scanBtn.style.pointerEvents = 'none';
 
     // Capture frame
     canvas.width  = video.videoWidth  || 640;
@@ -392,6 +421,7 @@ animation: card-in 0.35s cubic-bezier(0.16,1,0.3,1) both;
     statusDot.className = 'loading';
     loadWrap.classList.add('visible');
     hint.classList.remove('visible');
+    scanBtn.classList.add('scanning');
 
     const prompt = mode === 'invoice'
       ? `This image shows a pharmacy receipt or invoice listing drug/medication names with prices.
@@ -468,7 +498,8 @@ If no label is visible, return [].`;
     statusDot.className = 'active';
     loadWrap.classList.remove('visible');
     isAnalyzing = false;
-    setTimeout(captureAndAnalyze, SCAN_INTERVAL_MS);
+    scanBtn.classList.remove('scanning');
+    scanBtn.style.pointerEvents = 'auto';
   }
 
   function showError(msg) {
