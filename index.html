@@ -1,0 +1,690 @@
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import * as XLSX from "xlsx";
+import {
+  Upload,
+  Download,
+  Search,
+  Pin,
+  PinOff,
+  Trash2,
+  ChevronDown,
+  ChevronUp,
+  FolderOpen,
+  X,
+  AlertCircle,
+} from "lucide-react";
+
+// ---- design tokens -------------------------------------------------------
+const ink = "#1C2739";
+const inkSoft = "#5B6478";
+const line = "#D8DCE6";
+const paper = "#F1EEE6";
+const card = "#FDFCFA";
+const overdue = "#A6402C";
+const overdueBg = "#F7E9E5";
+const dueSoon = "#B07A2C";
+const dueSoonBg = "#F6EFDE";
+const onTrack = "#3E6B57";
+
+const FONT_IMPORT =
+  "@import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap');";
+
+function normalize(h) {
+  return String(h || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function detectColumn(headers, keywords) {
+  const found = headers.find((h) => keywords.some((k) => normalize(h).includes(k)));
+  return found || "";
+}
+
+function parseAsDate(val) {
+  if (!val) return null;
+  if (val instanceof Date && !isNaN(val)) return val;
+  if (typeof val === "number") {
+    const d = XLSX.SSF.parse_date_code(val);
+    if (d) return new Date(d.y, d.m - 1, d.d);
+  }
+  const d = new Date(val);
+  return isNaN(d) ? null : d;
+}
+
+function fmtDate(d) {
+  if (!d) return "—";
+  return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+}
+
+function daysDiff(d) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const target = new Date(d);
+  target.setHours(0, 0, 0, 0);
+  return Math.round((target - today) / 86400000);
+}
+
+function statusOf(dueDate) {
+  if (!dueDate) return { label: "—", color: inkSoft, bg: "transparent" };
+  const diff = daysDiff(dueDate);
+  if (diff < 0) return { label: `${Math.abs(diff)}d overdue`, color: overdue, bg: overdueBg, key: "overdue" };
+  if (diff <= 3) return { label: diff === 0 ? "due today" : `due in ${diff}d`, color: dueSoon, bg: dueSoonBg, key: "soon" };
+  return { label: `due in ${diff}d`, color: onTrack, bg: "transparent", key: "ok" };
+}
+
+export default function ClaimsTatRegister() {
+  const [step, setStep] = useState("upload"); // upload | mapping | table
+  const [fileName, setFileName] = useState("");
+  const [headers, setHeaders] = useState([]);
+  const [rawRows, setRawRows] = useState([]);
+  const [contractCol, setContractCol] = useState("");
+  const [dueDateCol, setDueDateCol] = useState("");
+  const [tatCol, setTatCol] = useState("");
+  const [rows, setRows] = useState([]);
+  const [caMap, setCaMap] = useState({});
+  const [caList, setCaList] = useState([]);
+  const [search, setSearch] = useState("");
+  const [sortDir, setSortDir] = useState("asc");
+  const [error, setError] = useState("");
+  const [showManage, setShowManage] = useState(false);
+  const [resetArmed, setResetArmed] = useState(false);
+  const [storageReady, setStorageReady] = useState(false);
+  const fileInputRef = useRef(null);
+
+  // load persisted mapping ------------------------------------------------
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get("contract-ca-map", false);
+        if (res && res.value) setCaMap(JSON.parse(res.value));
+      } catch (e) {
+        /* no saved map yet */
+      }
+      try {
+        const res2 = await window.storage.get("ca-names", false);
+        if (res2 && res2.value) setCaList(JSON.parse(res2.value));
+      } catch (e) {
+        /* no saved list yet */
+      }
+      setStorageReady(true);
+    })();
+  }, []);
+
+  const persistCaMap = useCallback(async (newMap) => {
+    setCaMap(newMap);
+    try {
+      await window.storage.set("contract-ca-map", JSON.stringify(newMap), false);
+    } catch (e) {
+      console.error("Could not save CA mapping", e);
+    }
+  }, []);
+
+  const persistCaList = useCallback(async (newList) => {
+    setCaList(newList);
+    try {
+      await window.storage.set("ca-names", JSON.stringify(newList), false);
+    } catch (e) {
+      console.error("Could not save CA list", e);
+    }
+  }, []);
+
+  const registerCaName = (name) => {
+    if (name && !caList.includes(name)) persistCaList([...caList, name].sort());
+  };
+
+  // file upload -------------------------------------------------------------
+  const handleFile = async (file) => {
+    setError("");
+    if (!file) return;
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const json = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+      if (!json.length) {
+        setError("That sheet looks empty. Check the file has a header row and at least one claim.");
+        return;
+      }
+      const hdrs = Object.keys(json[0]);
+      setHeaders(hdrs);
+      setRawRows(json);
+      setFileName(file.name);
+      setContractCol(detectColumn(hdrs, ["contract"]));
+      setDueDateCol(detectColumn(hdrs, ["duedate", "due"]));
+      setTatCol(detectColumn(hdrs, ["tat", "turnaround"]));
+      setStep("mapping");
+    } catch (e) {
+      console.error(e);
+      setError("Couldn't read that file. Make sure it's the .xlsx report you downloaded.");
+    }
+  };
+
+  const buildTable = () => {
+    if (!contractCol || !dueDateCol) {
+      setError("Pick which column is the Contract Number and which is the Due Date.");
+      return;
+    }
+    const built = rawRows.map((r, i) => {
+      const contract = String(r[contractCol] ?? "").trim();
+      const due = parseAsDate(r[dueDateCol]);
+      return {
+        _id: i,
+        _contract: contract,
+        _due: due,
+        _ca: caMap[contract] || "",
+        _dirty: false,
+        raw: r,
+      };
+    });
+    setRows(built);
+    setStep("table");
+    setError("");
+  };
+
+  // CA editing --------------------------------------------------------------
+  const handleCaInput = (id, value) => {
+    setRows((prev) =>
+      prev.map((r) => (r._id === id ? { ...r, _ca: value, _dirty: (caMap[r._contract] || "") !== value } : r))
+    );
+  };
+
+  const saveAsDefault = (id) => {
+    const row = rows.find((r) => r._id === id);
+    if (!row) return;
+    const newMap = { ...caMap, [row._contract]: row._ca };
+    persistCaMap(newMap);
+    registerCaName(row._ca);
+    setRows((prev) =>
+      prev.map((r) => (r._contract === row._contract ? { ...r, _ca: row._ca, _dirty: false } : r))
+    );
+  };
+
+  // export --------------------------------------------------------------
+  const handleExport = () => {
+    const out = rows.map((r) => {
+      const status = statusOf(r._due);
+      const obj = { ...r.raw };
+      obj["Status"] = status.label;
+      obj["CA"] = r._ca || "";
+      return obj;
+    });
+    const ws = XLSX.utils.json_to_sheet(out);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Claims TAT");
+    const arrBuf = XLSX.write(wb, { type: "array", bookType: "xlsx" });
+    const blob = new Blob([arrBuf], { type: "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const base = fileName ? fileName.replace(/\.[^.]+$/, "") : "claims-report";
+    a.href = url;
+    a.download = `${base}-tagged.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const resetAll = () => {
+    setStep("upload");
+    setFileName("");
+    setHeaders([]);
+    setRawRows([]);
+    setRows([]);
+    setContractCol("");
+    setDueDateCol("");
+    setTatCol("");
+    setError("");
+  };
+
+  // derived --------------------------------------------------------------
+  const stats = useMemo(() => {
+    let od = 0,
+      soon = 0;
+    rows.forEach((r) => {
+      const s = statusOf(r._due);
+      if (s.key === "overdue") od++;
+      else if (s.key === "soon") soon++;
+    });
+    return { total: rows.length, overdue: od, soon };
+  }, [rows]);
+
+  const visibleRows = useMemo(() => {
+    let list = rows;
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      list = list.filter(
+        (r) => r._contract.toLowerCase().includes(q) || (r._ca || "").toLowerCase().includes(q)
+      );
+    }
+    list = [...list].sort((a, b) => {
+      const av = a._due ? a._due.getTime() : Infinity;
+      const bv = b._due ? b._due.getTime() : Infinity;
+      return sortDir === "asc" ? av - bv : bv - av;
+    });
+    return list;
+  }, [rows, search, sortDir]);
+
+  const otherCols = headers.filter((h) => h !== contractCol && h !== dueDateCol);
+
+  const mappedContracts = Object.keys(caMap).filter((k) => caMap[k]);
+
+  return (
+    <div style={{ background: paper, minHeight: "100vh", fontFamily: "'IBM Plex Sans', sans-serif", color: ink }}>
+      <style>{FONT_IMPORT}</style>
+
+      {/* header */}
+      <div style={{ borderBottom: `1px solid ${line}`, background: card }}>
+        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "22px 28px" }}>
+          <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+            <div>
+              <h1
+                style={{
+                  fontFamily: "'Source Serif 4', serif",
+                  fontSize: 26,
+                  fontWeight: 600,
+                  margin: 0,
+                  letterSpacing: "-0.01em",
+                }}
+              >
+                Claims TAT Register
+              </h1>
+              <p style={{ margin: "4px 0 0", fontSize: 13.5, color: inkSoft }}>
+                Upload the claims report, tag each contract to a CA, export a clean sheet.
+              </p>
+            </div>
+            {step === "table" && (
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <button
+                  onClick={() => setShowManage(true)}
+                  style={btnGhost}
+                >
+                  <FolderOpen size={15} style={{ marginRight: 6 }} />
+                  Manage tags ({mappedContracts.length})
+                </button>
+                <button onClick={resetAll} style={btnGhost}>
+                  <Upload size={15} style={{ marginRight: 6 }} />
+                  New file
+                </button>
+                <button onClick={handleExport} style={btnPrimary}>
+                  <Download size={15} style={{ marginRight: 6 }} />
+                  Export Excel
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1180, margin: "0 auto", padding: "28px" }}>
+        {/* upload step */}
+        {step === "upload" && (
+          <div
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault();
+              handleFile(e.dataTransfer.files?.[0]);
+            }}
+            style={{
+              border: `1.5px dashed ${line}`,
+              background: card,
+              borderRadius: 4,
+              padding: "72px 24px",
+              textAlign: "center",
+              marginTop: 12,
+            }}
+          >
+            <Upload size={30} color={inkSoft} style={{ marginBottom: 14 }} />
+            <div style={{ fontSize: 16, fontWeight: 500, marginBottom: 6 }}>
+              Drop your claims report here
+            </div>
+            <div style={{ fontSize: 13.5, color: inkSoft, marginBottom: 20 }}>
+              .xlsx file with a Contract Number and Due Date column · dropped or picked, nothing leaves your browser
+            </div>
+            <button onClick={() => fileInputRef.current?.click()} style={btnPrimary}>
+              Choose file
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".xlsx,.xls"
+              style={{ display: "none" }}
+              onChange={(e) => handleFile(e.target.files?.[0])}
+            />
+            {error && <div style={errorBox}>{error}</div>}
+          </div>
+        )}
+
+        {/* mapping step */}
+        {step === "mapping" && (
+          <div style={{ background: card, border: `1px solid ${line}`, borderRadius: 4, padding: 28, marginTop: 12 }}>
+            <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>Confirm the columns</div>
+            <div style={{ fontSize: 13, color: inkSoft, marginBottom: 20 }}>
+              {fileName} · {rawRows.length} rows · we guessed these from your headers, fix anything that's off.
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginBottom: 20 }}>
+              <MappingSelect label="Contract Number" value={contractCol} onChange={setContractCol} options={headers} />
+              <MappingSelect label="Due Date" value={dueDateCol} onChange={setDueDateCol} options={headers} />
+              <MappingSelect label="TAT (optional)" value={tatCol} onChange={setTatCol} options={["", ...headers]} />
+            </div>
+            {error && <div style={errorBox}>{error}</div>}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={buildTable} style={btnPrimary}>Build register</button>
+              <button onClick={resetAll} style={btnGhost}>Back</button>
+            </div>
+          </div>
+        )}
+
+        {/* table step */}
+        {step === "table" && (
+          <>
+            <div style={{ display: "flex", gap: 22, marginBottom: 18, flexWrap: "wrap" }}>
+              <Stat label="claims" value={stats.total} color={ink} />
+              <Stat label="overdue" value={stats.overdue} color={overdue} />
+              <Stat label="due within 3 days" value={stats.soon} color={dueSoon} />
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+              <div style={{ position: "relative", flex: "1 1 280px", maxWidth: 360 }}>
+                <Search size={14} color={inkSoft} style={{ position: "absolute", left: 10, top: 10 }} />
+                <input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Search contract or CA…"
+                  style={{ ...inputStyle, paddingLeft: 30, width: "100%" }}
+                />
+              </div>
+              <div style={{ fontSize: 12.5, color: inkSoft }}>
+                {fileName}
+              </div>
+            </div>
+
+            <div style={{ background: card, border: `1px solid ${line}`, borderRadius: 4, overflow: "hidden" }}>
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13.5 }}>
+                  <thead>
+                    <tr style={{ borderBottom: `1px solid ${line}`, background: "#F7F5F0" }}>
+                      <Th>Contract #</Th>
+                      <Th onClick={() => setSortDir(sortDir === "asc" ? "desc" : "asc")} sortable dir={sortDir}>
+                        Due Date
+                      </Th>
+                      <Th>Status</Th>
+                      {tatCol && <Th>TAT</Th>}
+                      {otherCols
+                        .filter((c) => c !== tatCol)
+                        .map((c) => (
+                          <Th key={c}>{c}</Th>
+                        ))}
+                      <Th>CA</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleRows.map((r) => {
+                      const s = statusOf(r._due);
+                      return (
+                        <tr
+                          key={r._id}
+                          style={{
+                            borderBottom: `1px solid ${line}`,
+                            borderLeft: `3px solid ${s.key === "overdue" ? overdue : s.key === "soon" ? dueSoon : "transparent"}`,
+                          }}
+                        >
+                          <Td mono>{r._contract}</Td>
+                          <Td mono>{fmtDate(r._due)}</Td>
+                          <Td>
+                            <span style={{ color: s.color, background: s.bg, padding: "2px 8px", borderRadius: 3, fontSize: 12 }}>
+                              {s.label}
+                            </span>
+                          </Td>
+                          {tatCol && <Td mono>{String(r.raw[tatCol] ?? "")}</Td>}
+                          {otherCols
+                            .filter((c) => c !== tatCol)
+                            .map((c) => (
+                              <Td key={c}>{String(r.raw[c] ?? "")}</Td>
+                            ))}
+                          <Td>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <input
+                                list="ca-suggestions"
+                                value={r._ca}
+                                onChange={(e) => handleCaInput(r._id, e.target.value)}
+                                placeholder="Assign CA"
+                                style={{ ...inputStyle, width: 130, fontSize: 13 }}
+                              />
+                              <button
+                                title={r._dirty ? "Save as default for this contract" : "Saved as default"}
+                                onClick={() => saveAsDefault(r._id)}
+                                disabled={!r._ca}
+                                style={{
+                                  border: "none",
+                                  background: "transparent",
+                                  cursor: r._ca ? "pointer" : "default",
+                                  color: r._dirty ? dueSoon : r._ca ? onTrack : line,
+                                  padding: 2,
+                                }}
+                              >
+                                {r._dirty ? <Pin size={14} /> : <PinOff size={14} />}
+                              </button>
+                            </div>
+                          </Td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <datalist id="ca-suggestions">
+              {caList.map((n) => (
+                <option key={n} value={n} />
+              ))}
+            </datalist>
+            <div style={{ fontSize: 12, color: inkSoft, marginTop: 10 }}>
+              Pin an assignment to make it the default for that contract next time you upload a report.
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* manage tags panel */}
+      {showManage && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(28,39,57,0.35)",
+            display: "flex",
+            justifyContent: "flex-end",
+            zIndex: 50,
+          }}
+          onClick={() => setShowManage(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 380,
+              maxWidth: "90vw",
+              background: card,
+              height: "100%",
+              padding: 24,
+              overflowY: "auto",
+              borderLeft: `1px solid ${line}`,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <div style={{ fontSize: 16, fontWeight: 600 }}>Saved contract tags</div>
+              <button onClick={() => setShowManage(false)} style={{ border: "none", background: "transparent", cursor: "pointer" }}>
+                <X size={18} />
+              </button>
+            </div>
+            <div style={{ fontSize: 12.5, color: inkSoft, marginBottom: 18 }}>
+              These auto-apply the next time a contract number shows up in an uploaded report.
+            </div>
+            {mappedContracts.length === 0 && (
+              <div style={{ fontSize: 13, color: inkSoft }}>No saved tags yet. Pin a CA assignment in the table to create one.</div>
+            )}
+            {mappedContracts.sort().map((cnum) => (
+              <div
+                key={cnum}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  padding: "8px 0",
+                  borderBottom: `1px solid ${line}`,
+                }}
+              >
+                <div style={{ flex: 1, fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }}>{cnum}</div>
+                <input
+                  list="ca-suggestions"
+                  defaultValue={caMap[cnum]}
+                  onBlur={(e) => {
+                    const newMap = { ...caMap, [cnum]: e.target.value };
+                    persistCaMap(newMap);
+                    registerCaName(e.target.value);
+                    setRows((prev) => prev.map((r) => (r._contract === cnum ? { ...r, _ca: e.target.value, _dirty: false } : r)));
+                  }}
+                  style={{ ...inputStyle, width: 120, fontSize: 12.5 }}
+                />
+                <button
+                  onClick={() => {
+                    const newMap = { ...caMap };
+                    delete newMap[cnum];
+                    persistCaMap(newMap);
+                  }}
+                  style={{ border: "none", background: "transparent", cursor: "pointer", color: overdue }}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            ))}
+
+            <div style={{ marginTop: 24, paddingTop: 16, borderTop: `1px solid ${line}` }}>
+              {!resetArmed ? (
+                <button onClick={() => setResetArmed(true)} style={{ ...btnGhost, color: overdue, borderColor: overdue }}>
+                  Clear all saved tags
+                </button>
+              ) : (
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <AlertCircle size={14} color={overdue} />
+                  <span style={{ fontSize: 12.5 }}>Remove every saved tag?</span>
+                  <button
+                    onClick={() => {
+                      persistCaMap({});
+                      setResetArmed(false);
+                    }}
+                    style={{ ...btnGhost, color: overdue, borderColor: overdue, padding: "4px 10px" }}
+                  >
+                    Yes, clear
+                  </button>
+                  <button onClick={() => setResetArmed(false)} style={{ ...btnGhost, padding: "4px 10px" }}>
+                    Cancel
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- small pieces ---------------------------------------------------------
+function MappingSelect({ label, value, onChange, options }) {
+  return (
+    <div>
+      <div style={{ fontSize: 12, color: inkSoft, marginBottom: 5 }}>{label}</div>
+      <select value={value} onChange={(e) => onChange(e.target.value)} style={{ ...inputStyle, width: "100%" }}>
+        <option value="">Select column…</option>
+        {options.map((h) => (
+          <option key={h} value={h}>
+            {h || "(none)"}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function Stat({ label, value, color }) {
+  return (
+    <div>
+      <div style={{ fontFamily: "'Source Serif 4', serif", fontSize: 26, fontWeight: 600, color }}>{value}</div>
+      <div style={{ fontSize: 12, color: inkSoft }}>{label}</div>
+    </div>
+  );
+}
+
+function Th({ children, onClick, sortable, dir }) {
+  return (
+    <th
+      onClick={onClick}
+      style={{
+        textAlign: "left",
+        padding: "10px 12px",
+        fontWeight: 600,
+        fontSize: 12,
+        color: inkSoft,
+        cursor: sortable ? "pointer" : "default",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {children}
+      {sortable && (dir === "asc" ? <ChevronUp size={11} style={{ marginLeft: 4, verticalAlign: -1 }} /> : <ChevronDown size={11} style={{ marginLeft: 4, verticalAlign: -1 }} />)}
+    </th>
+  );
+}
+
+function Td({ children, mono }) {
+  return (
+    <td style={{ padding: "9px 12px", fontFamily: mono ? "'IBM Plex Mono', monospace" : undefined, whiteSpace: "nowrap" }}>
+      {children}
+    </td>
+  );
+}
+
+// ---- shared styles ---------------------------------------------------------
+const btnPrimary = {
+  background: ink,
+  color: "#fff",
+  border: "none",
+  borderRadius: 3,
+  padding: "8px 16px",
+  fontSize: 13.5,
+  fontWeight: 500,
+  cursor: "pointer",
+  display: "inline-flex",
+  alignItems: "center",
+};
+
+const btnGhost = {
+  background: "transparent",
+  color: ink,
+  border: `1px solid ${line}`,
+  borderRadius: 3,
+  padding: "8px 14px",
+  fontSize: 13.5,
+  fontWeight: 500,
+  cursor: "pointer",
+  display: "inline-flex",
+  alignItems: "center",
+};
+
+const inputStyle = {
+  border: `1px solid ${line}`,
+  borderRadius: 3,
+  padding: "7px 10px",
+  fontSize: 13.5,
+  fontFamily: "'IBM Plex Sans', sans-serif",
+  outline: "none",
+  background: "#fff",
+  color: ink,
+};
+
+const errorBox = {
+  marginTop: 16,
+  fontSize: 13,
+  color: overdue,
+  background: overdueBg,
+  padding: "10px 14px",
+  borderRadius: 3,
+  display: "inline-block",
+};
